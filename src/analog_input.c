@@ -6,6 +6,12 @@
 
 #define DT_DRV_COMPAT zmk_analog_input
 
+/* ---- 360_mouse tuning ---- */
+#define AI_CURVE_BLEND     2      /* 0 = linear, up to 4 = fully quadratic */
+#define AI_ACCEL_PCT      90      /* % of mv_min_max that counts as "at max" */
+#define AI_ACCEL_RAMP_MS 1500     /* time to reach full boost */
+#define AI_ACCEL_BOOST    25      /* multiplier once fully ramped */
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/input/input.h>
@@ -89,7 +95,49 @@ static int analog_input_report_data(const struct device *dev) {
         }
 
         if (ch_cfg.invert) v *= -1;
-        v = (int16_t)((v * ch_cfg.scale_multiplier) / ch_cfg.scale_divisor);
+
+        {
+            static int32_t acc[8] = {0};
+            static int64_t hold_start[8] = {0};
+            if (i < 8) {
+                if (v == 0) {
+                    acc[i] = 0;
+                    hold_start[i] = 0;
+                } else {
+                    int32_t sign = (v < 0) ? -1 : 1;
+                    int32_t av   = (v < 0) ? -(int32_t)v : (int32_t)v;
+                    int32_t mm2  = (int32_t)ch_cfg.mv_min_max;
+
+                    /* response curve: blend linear with quadratic */
+                    if (mm2 > 0 && AI_CURVE_BLEND > 0) {
+                        int32_t quad = (av * av) / mm2;
+                        av = (av * (4 - AI_CURVE_BLEND) + quad * AI_CURVE_BLEND) / 4;
+                        if (av < 1) av = 1;
+                    }
+
+                    /* hold acceleration near full deflection */
+                    if (mm2 > 0 && av * 100 >= mm2 * AI_ACCEL_PCT) {
+                        int64_t nowms = k_uptime_get();
+                        if (hold_start[i] == 0) hold_start[i] = nowms;
+                        int32_t held = (int32_t)(nowms - hold_start[i]);
+                        if (held > AI_ACCEL_RAMP_MS) held = AI_ACCEL_RAMP_MS;
+                        int32_t boost = 100 + ((AI_ACCEL_BOOST - 1) * 100 * held)
+                                              / AI_ACCEL_RAMP_MS;
+                        av = (av * boost) / 100;
+                    } else {
+                        hold_start[i] = 0;
+                    }
+
+                    acc[i] += sign * av * ch_cfg.scale_multiplier;
+                    int32_t out = acc[i] / (int32_t)ch_cfg.scale_divisor;
+                    acc[i] -= out * (int32_t)ch_cfg.scale_divisor;
+                    v = (int16_t)out;
+                }
+            } else {
+                v = (int16_t)(((int32_t)v * ch_cfg.scale_multiplier)
+                              / ch_cfg.scale_divisor);
+            }
+        }
 
         if (ch_cfg.report_on_change_only) {
             // track raw value to compare until next report interval
