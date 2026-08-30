@@ -6,7 +6,7 @@
 
 #define DT_DRV_COMPAT zmk_analog_input
 
-/* ---- 360_mouse tuning ---- */
+/* ---- 360_mouse tuning */
 #define AI_CURVE_BLEND     2      /* 0 = linear, up to 4 = fully quadratic */
 #define AI_ACCEL_PCT      90      /* % of mv_min_max that counts as "at max" */
 #define AI_ACCEL_RAMP_MS 1500     /* time to reach full boost */
