@@ -11,6 +11,8 @@
 #define AI_ACCEL_PCT      90      /* % of mv_min_max that counts as "at max" */
 #define AI_ACCEL_RAMP_MS 1500     /* time to reach full boost */
 #define AI_ACCEL_BOOST    25      /* multiplier once fully ramped */
+#define AI_CAL_SAMPLES   20     /* 200ms @ 100Hz */
+#define AI_CAL_WINDOW   300     /* max mV deviation from DT value to accept */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
@@ -18,6 +20,7 @@
 #include <zmk/keymap.h>
 #include <stdlib.h> //for abs()
 #include <zephyr/sys/util.h> // for CLAMP
+#include <string.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
@@ -78,7 +81,44 @@ static int analog_input_report_data(const struct device *dev) {
         LOG_DBG("AIN%u raw: %d mv: %d", ch_cfg.adc_channel.channel_id, raw, mv);
 #endif
 
-        int16_t v = mv - ch_cfg.mv_mid;
+        /* boot-time centre calibration */
+        static uint16_t cal_mid[8];
+        static uint16_t cal_buf[8][AI_CAL_SAMPLES];
+        static uint8_t  cal_n[8];
+        static bool     cal_done[8];
+
+        uint16_t mid = ch_cfg.mv_mid;
+        if (i < 8) {
+            if (!cal_done[i]) {
+                cal_buf[i][cal_n[i]++] = (uint16_t)mv;
+                if (cal_n[i] >= AI_CAL_SAMPLES) {
+                    uint16_t tmp[AI_CAL_SAMPLES];
+                    memcpy(tmp, cal_buf[i], sizeof(tmp));
+                    for (int x = 1; x < AI_CAL_SAMPLES; x++) {
+                        uint16_t key = tmp[x];
+                        int y = x - 1;
+                        while (y >= 0 && tmp[y] > key) { tmp[y + 1] = tmp[y]; y--; }
+                        tmp[y + 1] = key;
+                    }
+                    uint16_t med = tmp[AI_CAL_SAMPLES / 2];
+                    int32_t diff = (int32_t)med - (int32_t)ch_cfg.mv_mid;
+                    if (diff < 0) diff = -diff;
+                    if (diff <= AI_CAL_WINDOW) {
+                        cal_mid[i] = med;
+                        LOG_INF("AIN%u calibrated mid %u (dt %u)", ch_cfg.adc_channel.channel_id, med, ch_cfg.mv_mid);
+                    } else {
+                        cal_mid[i] = ch_cfg.mv_mid;
+                        LOG_WRN("AIN%u cal %u rejected, |diff| %d > %d; using dt %u",
+                                i, med, diff, AI_CAL_WINDOW, ch_cfg.mv_mid);
+                    }
+                    cal_done[i] = true;
+                }
+                continue;   /* emit nothing while calibrating */
+            }
+            mid = cal_mid[i];
+        }
+
+        int16_t v = mv - mid;
         int16_t dz = ch_cfg.mv_deadzone;
         if (dz) {
             if (v > 0) {
