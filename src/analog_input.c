@@ -7,8 +7,8 @@
 #define DT_DRV_COMPAT zmk_analog_input
 
 /* ---- 360_mouse tuning */
-#define AI_CURVE_BLEND     2      /* 0 = linear, up to 4 = fully quadratic */
-#define AI_ACCEL_PCT      90      /* % of mv_min_max that counts as "at max" */
+#define AI_CURVE_BLEND     1      /* 0 = linear, up to 4 = fully quadratic */
+#define AI_ACCEL_PCT      97      /* % of mv_min_max that counts as "at max" */
 #define AI_ACCEL_RAMP_MS 1500     /* time to reach full boost */
 #define AI_ACCEL_BOOST    25      /* multiplier once fully ramped */
 #define AI_CAL_SAMPLES   20     /* 200ms @ 100Hz */
@@ -336,7 +336,9 @@ static void analog_input_async_init(struct k_work *work) {
     for (uint8_t i = 0; i < config->io_channels_len; i++) {
         struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
         const struct device* adc = ch_cfg.adc_channel.dev;
-        uint8_t channel_id = ch_cfg.adc_channel.channel_id;
+        /* battery driver (VDDH) owns ADC channel 0 - shift ours up by one */
+        uint8_t ain = ch_cfg.adc_channel.channel_id;
+        uint8_t channel_id = ain + 1;
         
 #if CONFIG_ANALOG_INPUT_USE_DTS_ADC_CH_CFG
         struct adc_channel_cfg channel_cfg = ch_cfg.adc_channel.channel_cfg;
@@ -348,7 +350,7 @@ static void analog_input_async_init(struct k_work *work) {
             .channel_id = channel_id,
             #ifdef CONFIG_ADC_CONFIGURABLE_INPUTS
                 #ifdef CONFIG_ADC_NRFX_SAADC
-                    .input_positive = SAADC_CH_PSELP_PSELP_AnalogInput0 + channel_id,
+                    .input_positive = SAADC_CH_PSELP_PSELP_AnalogInput0 + ain,
                 #else /* CONFIG_ADC_NRFX_SAADC */
                     .input_positive = channel_id,
                 #endif /* CONFIG_ADC_NRFX_SAADC */

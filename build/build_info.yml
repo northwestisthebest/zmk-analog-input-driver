@@ -1,0 +1,5 @@
+west:
+  command: /home/nortem/.zinstaller/.venv/bin/west build -p -b nice_nano -S zmk-usb-logging
+    -- -DSHIELD=360_mouse -DZEPHYR_SDK_INSTALL_DIR=/home/nortem/zephyr-sdk-0.17.0
+  topdir: /home/nortem/Documents/zephyrproject
+  version: 1.5.0
