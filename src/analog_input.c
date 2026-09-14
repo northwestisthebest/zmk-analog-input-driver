@@ -8,11 +8,14 @@
 
 /* ---- 360_mouse tuning */
 #define AI_CURVE_BLEND     1      /* 0 = linear, up to 4 = fully quadratic */
-#define AI_ACCEL_PCT      97      /* % of mv_min_max that counts as "at max" */
-#define AI_ACCEL_RAMP_MS 1500     /* time to reach full boost */
+#define AI_ACCEL_RAMP_MS 2000     /* time to reach full boost */
 #define AI_ACCEL_BOOST    25      /* multiplier once fully ramped */
 #define AI_CAL_SAMPLES   20     /* 200ms @ 100Hz */
-#define AI_CAL_WINDOW   300     /* max mV deviation from DT value to accept */
+#define AI_CAL_WINDOW   150     /* max mV deviation from DT value to accept */
+#define AI_DZ_SETTLE   5    /* consecutive in-deadzone samples before re-priming */
+#define AI_CAL_ENABLE    0    /* 0 = use devicetree mv-mid */
+#define AI_ADC_TOP_MV    3300   /* pot upper rail, measured */
+#define AI_ACCEL_EDGE_MV  10   /* trigger within this distance of either rail */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
@@ -80,6 +83,8 @@ static int analog_input_report_data(const struct device *dev) {
 #if IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_RAW)
         LOG_DBG("AIN%u raw: %d mv: %d", ch_cfg.adc_channel.channel_id, raw, mv);
 #endif
+        uint16_t mid = ch_cfg.mv_mid;
+        #if AI_CAL_ENABLE
 
         /* boot-time centre calibration */
         static uint16_t cal_mid[8];
@@ -87,7 +92,6 @@ static int analog_input_report_data(const struct device *dev) {
         static uint8_t  cal_n[8];
         static bool     cal_done[8];
 
-        uint16_t mid = ch_cfg.mv_mid;
         if (i < 8) {
             if (!cal_done[i]) {
                 cal_buf[i][cal_n[i]++] = (uint16_t)mv;
@@ -117,6 +121,7 @@ static int analog_input_report_data(const struct device *dev) {
             }
             mid = cal_mid[i];
         }
+        #endif
 
         int16_t v = mv - mid;
         int16_t dz = ch_cfg.mv_deadzone;
@@ -140,10 +145,17 @@ static int analog_input_report_data(const struct device *dev) {
             static int32_t acc[8] = {0};
             static int64_t hold_start[8] = {0};
             if (i < 8) {
+                static uint8_t dz_n[8];
                 if (v == 0) {
-                    acc[i] = 0;
-                    hold_start[i] = 0;
+                    if (dz_n[i] < 255) dz_n[i]++;
+                    if (dz_n[i] >= AI_DZ_SETTLE) {
+                        acc[i] = 0;
+                        hold_start[i] = 0;
+                    }
+                    /* brief dips: leave acc alone, emit nothing */
                 } else {
+                    bool was_resting = (dz_n[i] >= AI_DZ_SETTLE);
+                    dz_n[i] = 0;
                     int32_t sign = (v < 0) ? -1 : 1;
                     int32_t av   = (v < 0) ? -(int32_t)v : (int32_t)v;
                     int32_t mm2  = (int32_t)ch_cfg.mv_min_max;
@@ -155,8 +167,10 @@ static int analog_input_report_data(const struct device *dev) {
                         if (av < 1) av = 1;
                     }
 
-                    /* hold acceleration near full deflection */
-                    if (mm2 > 0 && av * 100 >= mm2 * AI_ACCEL_PCT) {
+                    /* hold acceleration near full deflection —
+                       tested on RAW deflection, not the curved value */
+                    if (mv <= AI_ACCEL_EDGE_MV ||
+                        mv >= (AI_ADC_TOP_MV - AI_ACCEL_EDGE_MV)) {
                         int64_t nowms = k_uptime_get();
                         if (hold_start[i] == 0) hold_start[i] = nowms;
                         int32_t held = (int32_t)(nowms - hold_start[i]);
@@ -168,6 +182,13 @@ static int analog_input_report_data(const struct device *dev) {
                         hold_start[i] = 0;
                     }
 
+                    /* prime in the direction of travel so the first sample
+                       out of a settled deadzone emits immediately either way */
+                    if (was_resting) {
+                        acc[i] = sign * ((int32_t)ch_cfg.scale_divisor - 1);
+                    }
+
+                    acc[i] += sign * av * ch_cfg.scale_multiplier;
                     acc[i] += sign * av * ch_cfg.scale_multiplier;
                     int32_t out = acc[i] / (int32_t)ch_cfg.scale_divisor;
                     acc[i] -= out * (int32_t)ch_cfg.scale_divisor;
@@ -193,7 +214,7 @@ static int analog_input_report_data(const struct device *dev) {
 
     // First read is setup as calibration
     as->calibrate = false;
-
+                                
 #if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
     // purge accumulated delta, if last sampled had not been reported on last report tick
     if (now - last_smp_time >= CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN) {
