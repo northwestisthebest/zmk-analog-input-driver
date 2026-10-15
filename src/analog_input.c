@@ -10,12 +10,13 @@
 #define AI_CURVE_BLEND     1      /* 0 = linear, up to 4 = fully quadratic */
 #define AI_ACCEL_RAMP_MS 2000     /* time to reach full boost */
 #define AI_ACCEL_BOOST    25      /* multiplier once fully ramped */
-#define AI_CAL_SAMPLES   20     /* 200ms @ 100Hz */
-#define AI_CAL_WINDOW   150     /* max mV deviation from DT value to accept */
+#define AI_CAL_SAMPLES   50     /* 200ms @ 100Hz */
+#define AI_CAL_WINDOW   400     /* max mV deviation from DT value to accept */
 #define AI_DZ_SETTLE   5    /* consecutive in-deadzone samples before re-priming */
-#define AI_CAL_ENABLE    0    /* 0 = use devicetree mv-mid */
+#define AI_CAL_ENABLE    1    /* 0 = use devicetree mv-mid */
 #define AI_ADC_TOP_MV    3300   /* pot upper rail, measured */
-#define AI_ACCEL_EDGE_MV  10   /* trigger within this distance of either rail */
+#define AI_ACCEL_EDGE_MV  20   /* trigger within this distance of either rail */
+#define AI_CROSS_DZ_MV  800   /* deadzone for the non-owning axis; 0 disables */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
@@ -29,6 +30,9 @@
 LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
 
 #include <zmk/drivers/analog_input.h>
+
+static int8_t   scroll_owner = -1;   /* channel index owning scroll, -1 = none */
+static uint16_t mid_now[8];          /* resolved centre per channel */
 
 static int analog_input_report_data(const struct device *dev) {
     struct analog_input_data *data = dev->data;
@@ -77,6 +81,33 @@ static int analog_input_report_data(const struct device *dev) {
 #endif
         }
 
+#if AI_CROSS_DZ_MV > 0
+        if (i == 0 && config->io_channels_len == 2) {
+            int32_t d[2];
+            for (uint8_t c = 0; c < 2; c++) {
+                int32_t cmv = data->as_buff[c];
+                adc_raw_to_millivolts(adc_ref_internal(adc), ADC_GAIN_1_6,
+                                      as->resolution, &cmv);
+                int32_t cmid = mid_now[c] ? mid_now[c] : config->io_channels[c].mv_mid;
+                d[c] = cmv - cmid;
+                if (d[c] < 0) d[c] = -d[c];
+            }
+            /* owner back inside its own deadzone: release */
+            if (scroll_owner >= 0 &&
+                d[scroll_owner] <= config->io_channels[scroll_owner].mv_deadzone) {
+                scroll_owner = -1;
+            }
+            /* no owner: first axis out of its deadzone takes it */
+            if (scroll_owner < 0) {
+                bool a0 = d[0] > config->io_channels[0].mv_deadzone;
+                bool a1 = d[1] > config->io_channels[1].mv_deadzone;
+                if (a0 && a1)  scroll_owner = (d[0] >= d[1]) ? 0 : 1;
+                else if (a0)   scroll_owner = 0;
+                else if (a1)   scroll_owner = 1;
+            }
+        }
+#endif
+
         int32_t raw = data->as_buff[i];
         int32_t mv = raw;
         adc_raw_to_millivolts(adc_ref_internal(adc), ADC_GAIN_1_6, as->resolution, &mv);
@@ -123,8 +154,15 @@ static int analog_input_report_data(const struct device *dev) {
         }
         #endif
 
+        if (i < 8) mid_now[i] = mid;
         int16_t v = mv - mid;
         int16_t dz = ch_cfg.mv_deadzone;
+#if AI_CROSS_DZ_MV > 0
+        if (scroll_owner >= 0 && scroll_owner != i && dz < AI_CROSS_DZ_MV) {
+            dz = AI_CROSS_DZ_MV;
+        }
+#endif
+
         if (dz) {
             if (v > 0) {
                 if (v < dz) v = 0; else v -= dz;
