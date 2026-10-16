@@ -61,6 +61,9 @@ struct analog_input_io_channel {
 
 struct analog_input_config {
     uint32_t sampling_hz;
+    struct gpio_dt_spec power_gpio;   /* optional; .port == NULL when absent */
+    uint16_t power_settle_us;
+    uint16_t mv_top;
     uint8_t io_channels_len;
 	struct analog_input_io_channel io_channels[];
 };

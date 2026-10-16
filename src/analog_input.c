@@ -14,7 +14,7 @@
 #define AI_CAL_WINDOW   400     /* max mV deviation from DT value to accept */
 #define AI_DZ_SETTLE   5    /* consecutive in-deadzone samples before re-priming */
 #define AI_CAL_ENABLE    1    /* 0 = use devicetree mv-mid */
-#define AI_ADC_TOP_MV    3300   /* pot upper rail, measured */
+/* pot upper rail is now the DT property mv-top (default 3300) */
 #define AI_ACCEL_EDGE_MV  20   /* trigger within this distance of either rail */
 #define AI_CROSS_DZ_MV  800   /* deadzone for the non-owning axis; 0 disables */
 
@@ -25,6 +25,9 @@
 #include <stdlib.h> //for abs()
 #include <zephyr/sys/util.h> // for CLAMP
 #include <string.h>
+
+#include <zmk/event_manager.h>
+#include <zmk/events/activity_state_changed.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
@@ -56,15 +59,22 @@ static int analog_input_report_data(const struct device *dev) {
         const struct device* adc = ch_cfg.adc_channel.dev;
 
         if (i == 0) {
+            /* optional pot power gating: rail is up only for this read */
+            const bool gated = (config->power_gpio.port != NULL);
+            if (gated) {
+                gpio_pin_set_dt(&config->power_gpio, 1);
+                k_busy_wait(config->power_settle_us);
+            }
 #ifdef CONFIG_ADC_ASYNC
             int err = adc_read_async(adc, as, &data->async_sig);
-            if (err < 0) {
-                LOG_ERR("AIN%u read_async returned %d", i, err);
-                return err;
+            if (err == 0) {
+                err = k_poll(&data->async_evt, 1, K_FOREVER);
             }
-            err = k_poll(&data->async_evt, 1, K_FOREVER);
+            if (gated) {
+                gpio_pin_set_dt(&config->power_gpio, 0);
+            }
             if (err < 0) {
-                LOG_ERR("AIN%u k_poll returned %d", i, err);
+                LOG_ERR("ADC read returned %d", err);
                 return err;
             }
             if (!data->async_evt.signal->signaled) {
@@ -74,8 +84,11 @@ static int analog_input_report_data(const struct device *dev) {
     	    data->async_evt.state = K_POLL_STATE_NOT_READY;
 #else
             int err = adc_read(adc, as);
+            if (gated) {
+                gpio_pin_set_dt(&config->power_gpio, 0);
+            }
             if (err < 0) {
-                LOG_ERR("AIN%u read returned %d", i, err);
+                LOG_ERR("ADC read returned %d", err);
                 return err;
             }
 #endif
@@ -208,7 +221,7 @@ static int analog_input_report_data(const struct device *dev) {
                     /* hold acceleration near full deflection —
                        tested on RAW deflection, not the curved value */
                     if (mv <= AI_ACCEL_EDGE_MV ||
-                        mv >= (AI_ADC_TOP_MV - AI_ACCEL_EDGE_MV)) {
+                        mv >= ((int32_t)config->mv_top - AI_ACCEL_EDGE_MV)) {
                         int64_t nowms = k_uptime_get();
                         if (hold_start[i] == 0) hold_start[i] = nowms;
                         int32_t held = (int32_t)(nowms - hold_start[i]);
@@ -307,6 +320,27 @@ static int analog_input_report_data(const struct device *dev) {
     }
     return 0;
 }
+
+/* ---- pot power gating: force rails low before deep sleep ----------------
+ * A read in progress could be preempted by ZMK's sleep path with the rail
+ * still high, and nRF GPIO outputs keep their state in System OFF. The
+ * activity event is raised synchronously right before sys_poweroff(). */
+#define AI_MAX_GATED 4
+static const struct gpio_dt_spec *gated_pins[AI_MAX_GATED];
+static uint8_t gated_n;
+
+static int analog_input_activity_listener(const zmk_event_t *eh) {
+    const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
+    if (ev != NULL && ev->state == ZMK_ACTIVITY_SLEEP) {
+        for (uint8_t k = 0; k < gated_n; k++) {
+            gpio_pin_set_dt(gated_pins[k], 0);
+        }
+    }
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(analog_input_pwr, analog_input_activity_listener);
+ZMK_SUBSCRIPTION(analog_input_pwr, zmk_activity_state_changed);
 
 K_THREAD_STACK_DEFINE(analog_input_q_stack, CONFIG_ANALOG_INPUT_WORKQUEUE_STACK_SIZE);
 
@@ -463,6 +497,21 @@ static void analog_input_async_init(struct k_work *work) {
     data->async_evt = async_evt;
 #endif
 
+    if (config->power_gpio.port != NULL) {
+        if (!gpio_is_ready_dt(&config->power_gpio)) {
+            LOG_ERR("pot power GPIO not ready");
+        } else {
+            int perr = gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
+            if (perr < 0) {
+                LOG_ERR("pot power GPIO configure failed: %d", perr);
+            } else if (gated_n < AI_MAX_GATED) {
+                gated_pins[gated_n++] = &config->power_gpio;
+            }
+            LOG_INF("pot power gating on, settle %u us, mv-top %u",
+                    config->power_settle_us, config->mv_top);
+        }
+    }
+
     data->ready = true;
 
     k_work_init(&data->sampling_work, sampling_work_handler);
@@ -603,6 +652,9 @@ static const struct sensor_driver_api analog_input_driver_api = {
     };                                                                                             \
     static const struct analog_input_config config##n = {                                          \
         .sampling_hz = DT_PROP(DT_DRV_INST(n), sampling_hz),                                       \
+        .power_gpio = GPIO_DT_SPEC_INST_GET_OR(n, power_gpios, {0}),                               \
+        .power_settle_us = DT_INST_PROP(n, power_settle_us),                                       \
+        .mv_top = DT_INST_PROP(n, mv_top),                                                         \
         .io_channels_len = (DT_FOREACH_CHILD(DT_DRV_INST(n), ANIN_IOC_CHILD_LEN_PLUS_ONE) 0),      \
         .io_channels = { DT_INST_FOREACH_CHILD_SEP(n, TRANSFORMED_IO_CHANNEL_ENTRY, (, )) },       \
     };                                                                                             \

@@ -9,6 +9,23 @@ properties:
   sampling-hz:
     type: int
     default: 100
+  power-gpios:
+    type: phandle-array
+    description: |
+      Optional. Pin that powers the potentiometers. Driven active only for the
+      duration of each ADC read, inactive otherwise and during deep sleep.
+      Omit for boards where the pots are wired to the 3.3 V rail.
+  power-settle-us:
+    type: int
+    default: 50
+    description: Delay between powering the pots and sampling, in microseconds.
+  mv-top:
+    type: int
+    default: 3300
+    description: |
+      Measured wiper voltage at full deflection toward the supply rail, in mV.
+      Hold acceleration triggers within AI_ACCEL_EDGE_MV of this value.
+      A GPIO-powered pot sits a little below 3300, so re-measure when gating.
 
 child-binding:
   description: Per-channel configuration settings
