@@ -18,6 +18,17 @@
 #define AI_ACCEL_EDGE_MV  20   /* trigger within this distance of either rail */
 #define AI_CROSS_DZ_MV  800   /* deadzone for the non-owning axis; 0 disables */
 
+/* ---- game (WASD) mode: active while the DT game-layer is on */
+#define AI_GAME_ON_PCT        15   /* % of travel past deadzone to start moving */
+#define AI_GAME_OFF_PCT       10   /* ...and to stop again (hysteresis) */
+#define AI_GAME_FULL_PCT      85   /* at/after this the key is held solid */
+#define AI_GAME_PWM_MS       100   /* PWM period for partial deflection; 0 = plain on/off */
+#define AI_GAME_MIN_PULSE_MS  34   /* shortest press or gap, >= 2 frames at 60 fps */
+#define AI_GAME_KEEPALIVE_MS 1000  /* held keys keep ZMK out of idle/sleep */
+
+/* ---- sampling rate while ZMK is idle (no input for CONFIG_ZMK_IDLE_TIMEOUT) */
+#define AI_IDLE_HZ            20   /* 0 = keep the normal rate */
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/input/input.h>
@@ -28,6 +39,8 @@
 
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
+#include <zmk/events/keycode_state_changed.h>
+#include <zephyr/sys/atomic.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
@@ -36,6 +49,85 @@ LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
 
 static int8_t   scroll_owner = -1;   /* channel index owning scroll, -1 = none */
 static uint16_t mid_now[8];          /* resolved centre per channel */
+
+/* ---- game mode state -------------------------------------------------------
+ * Bit 2*i = channel i positive direction key, bit 2*i+1 = negative.
+ * The sampling thread only computes the wanted key set; the keys themselves
+ * are pressed/released from the system workqueue, where ZMK raises its own
+ * keycode events. */
+#define AI_NO_LAYER 255
+static uint32_t       game_keys[8];
+static atomic_t       game_want;
+static uint8_t        game_sent;
+static bool           game_engaged[4];
+static bool           game_on[4];
+static int64_t        game_last_flip[4];
+
+static void game_keys_work_cb(struct k_work *work) {
+    ARG_UNUSED(work);
+    uint8_t want = (uint8_t)atomic_get(&game_want);
+    uint8_t diff = want ^ game_sent;
+    int64_t ts = k_uptime_get();
+    for (uint8_t b = 0; b < 8; b++) {
+        if ((diff & BIT(b)) && game_keys[b]) {
+            raise_zmk_keycode_state_changed_from_encoded(game_keys[b], (want & BIT(b)) != 0, ts);
+        }
+    }
+    game_sent = want;
+}
+
+static K_WORK_DEFINE(game_keys_work, game_keys_work_cb);
+
+static void game_set_want(uint8_t want) {
+    if ((uint8_t)atomic_set(&game_want, want) != want) {
+        k_work_submit(&game_keys_work);
+    }
+}
+
+/* v: signed deflection past the deadzone, clamped to +-mm, already inverted */
+static uint8_t game_axis(uint8_t i, int16_t v, uint16_t mm, int64_t now) {
+    if (i >= 4 || mm == 0) {
+        return 0;
+    }
+    int32_t av  = (v < 0) ? -(int32_t)v : (int32_t)v;
+    int32_t pct = (av * 100) / mm;
+
+    if (!game_engaged[i] && pct >= AI_GAME_ON_PCT) {
+        game_engaged[i] = true;
+        game_on[i] = true;              /* respond immediately */
+        game_last_flip[i] = now;
+    } else if (game_engaged[i] && pct < AI_GAME_OFF_PCT) {
+        game_engaged[i] = false;
+        game_on[i] = false;
+    }
+    if (!game_engaged[i] || v == 0) {
+        return 0;
+    }
+
+    bool press = true;
+    if (AI_GAME_PWM_MS > 0 && pct < AI_GAME_FULL_PCT) {
+        int32_t span  = AI_GAME_FULL_PCT - AI_GAME_ON_PCT;
+        int32_t p     = CLAMP(pct - AI_GAME_ON_PCT, 0, span);
+        int32_t on_ms = AI_GAME_MIN_PULSE_MS +
+                        ((AI_GAME_PWM_MS - AI_GAME_MIN_PULSE_MS) * p) / span;
+        int32_t off_ms = AI_GAME_PWM_MS - on_ms;
+        if (off_ms >= AI_GAME_MIN_PULSE_MS) {
+            int64_t held = now - game_last_flip[i];
+            if (game_on[i] && held >= on_ms) {
+                game_on[i] = false;
+                game_last_flip[i] = now;
+            } else if (!game_on[i] && held >= off_ms) {
+                game_on[i] = true;
+                game_last_flip[i] = now;
+            }
+            press = game_on[i];
+        }
+    }
+    if (!press) {
+        return 0;
+    }
+    return (v > 0) ? BIT(2 * i) : BIT(2 * i + 1);
+}
 
 static int analog_input_report_data(const struct device *dev) {
     struct analog_input_data *data = dev->data;
@@ -53,6 +145,24 @@ static int analog_input_report_data(const struct device *dev) {
 #endif
 
     struct adc_sequence* as = &data->as;
+
+    /* game (WASD) mode follows the configured layer */
+    const bool game = (config->game_layer != AI_NO_LAYER) &&
+                      zmk_keymap_layer_active(config->game_layer);
+    static bool game_prev;
+    static int64_t game_keepalive;
+    uint8_t game_bits = 0;
+    const int64_t game_now = k_uptime_get();
+    if (game != game_prev) {
+        if (!game) {
+            memset(game_engaged, 0, sizeof(game_engaged));
+            memset(game_on, 0, sizeof(game_on));
+            game_set_want(0);
+        }
+        scroll_owner = -1;
+        game_prev = game;
+        LOG_INF("joystick %s mode", game ? "game" : "scroll");
+    }
 
     for (uint8_t i = 0; i < config->io_channels_len; i++) {
         struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
@@ -171,7 +281,7 @@ static int analog_input_report_data(const struct device *dev) {
         int16_t v = mv - mid;
         int16_t dz = ch_cfg.mv_deadzone;
 #if AI_CROSS_DZ_MV > 0
-        if (scroll_owner >= 0 && scroll_owner != i && dz < AI_CROSS_DZ_MV) {
+        if (!game && scroll_owner >= 0 && scroll_owner != i && dz < AI_CROSS_DZ_MV) {
             dz = AI_CROSS_DZ_MV;
         }
 #endif
@@ -191,6 +301,11 @@ static int analog_input_report_data(const struct device *dev) {
         }
 
         if (ch_cfg.invert) v *= -1;
+
+        if (game) {
+            game_bits |= game_axis(i, v, mm, game_now);
+            continue;   /* no scroll output in game mode */
+        }
 
         {
             static int32_t acc[8] = {0};
@@ -265,6 +380,16 @@ static int analog_input_report_data(const struct device *dev) {
 
     // First read is setup as calibration
     as->calibrate = false;
+
+    if (game) {
+        game_set_want(game_bits);
+        /* key events don't count as ZMK activity; an ignored input event does */
+        if (game_bits && game_now - game_keepalive >= AI_GAME_KEEPALIVE_MS) {
+            game_keepalive = game_now;
+            input_report(dev, INPUT_EV_MSC, INPUT_MSC_SCAN, 0, false, K_NO_WAIT);
+        }
+        return 0;
+    }
                                 
 #if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
     // purge accumulated delta, if last sampled had not been reported on last report tick
@@ -329,12 +454,46 @@ static int analog_input_report_data(const struct device *dev) {
 static const struct gpio_dt_spec *gated_pins[AI_MAX_GATED];
 static uint8_t gated_n;
 
+#define AI_MAX_DEVS 4
+static struct analog_input_data *ai_devs[AI_MAX_DEVS];
+static uint8_t ai_devs_n;
+
+static void ai_set_rate(struct analog_input_data *d, uint32_t hz) {
+    if (!d->enabled || hz == 0) {
+        return;
+    }
+    uint32_t usec = 1000000UL / hz;
+    k_timer_start(&d->sampling_timer, K_USEC(usec), K_USEC(usec));
+}
+
 static int analog_input_activity_listener(const zmk_event_t *eh) {
     const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
-    if (ev != NULL && ev->state == ZMK_ACTIVITY_SLEEP) {
+    if (ev == NULL) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+    switch (ev->state) {
+    case ZMK_ACTIVITY_SLEEP:
+        for (uint8_t k = 0; k < ai_devs_n; k++) {
+            k_timer_stop(&ai_devs[k]->sampling_timer);
+        }
         for (uint8_t k = 0; k < gated_n; k++) {
             gpio_pin_set_dt(gated_pins[k], 0);
         }
+        atomic_set(&game_want, 0);
+        game_keys_work_cb(NULL);   /* already on the system workqueue */
+        break;
+    case ZMK_ACTIVITY_IDLE:
+        for (uint8_t k = 0; k < ai_devs_n; k++) {
+            if (AI_IDLE_HZ > 0 && AI_IDLE_HZ < ai_devs[k]->sampling_hz) {
+                ai_set_rate(ai_devs[k], AI_IDLE_HZ);
+            }
+        }
+        break;
+    case ZMK_ACTIVITY_ACTIVE:
+        for (uint8_t k = 0; k < ai_devs_n; k++) {
+            ai_set_rate(ai_devs[k], ai_devs[k]->sampling_hz);
+        }
+        break;
     }
     return ZMK_EV_EVENT_BUBBLE;
 }
@@ -356,7 +515,6 @@ static void sampling_timer_handler(struct k_timer *timer) {
     struct analog_input_data *data = CONTAINER_OF(timer, struct analog_input_data, sampling_timer);
     // LOG_DBG("sampling timer triggered");
     k_work_submit_to_queue(&analog_input_work_q, &data->sampling_work);
-    k_work_submit(&data->sampling_work);
 }
 
 static int active_set_value(const struct device *dev, bool active) {
@@ -514,6 +672,17 @@ static void analog_input_async_init(struct k_work *work) {
         }
     }
 
+    if (ai_devs_n < AI_MAX_DEVS) {
+        ai_devs[ai_devs_n++] = data;
+    }
+    for (uint8_t i = 0; i < config->io_channels_len && i < 4; i++) {
+        game_keys[2 * i]     = config->io_channels[i].game_key_pos;
+        game_keys[2 * i + 1] = config->io_channels[i].game_key_neg;
+    }
+    if (config->game_layer != AI_NO_LAYER) {
+        LOG_INF("game mode on layer %u", config->game_layer);
+    }
+
     data->ready = true;
 
     k_work_init(&data->sampling_work, sampling_work_handler);
@@ -645,6 +814,8 @@ static const struct sensor_driver_api analog_input_driver_api = {
         .scale_divisor = DT_PROP(node_id, scale_divisor),                                          \
         .evt_type = DT_PROP(node_id, evt_type),                                                    \
         .input_code = DT_PROP(node_id, input_code),                                                \
+        .game_key_pos = DT_PROP(node_id, game_key_pos),                                            \
+        .game_key_neg = DT_PROP(node_id, game_key_neg),                                            \
     }
 
 #define ANIN_IOC_CHILD_LEN_PLUS_ONE(node) 1 +
@@ -657,6 +828,7 @@ static const struct sensor_driver_api analog_input_driver_api = {
         .power_gpio = GPIO_DT_SPEC_INST_GET_OR(n, power_gpios, {0}),                               \
         .power_settle_us = DT_INST_PROP(n, power_settle_us),                                       \
         .mv_top = DT_INST_PROP(n, mv_top),                                                         \
+        .game_layer = DT_INST_PROP(n, game_layer),                                                 \
         .io_channels_len = (DT_FOREACH_CHILD(DT_DRV_INST(n), ANIN_IOC_CHILD_LEN_PLUS_ONE) 0),      \
         .io_channels = { DT_INST_FOREACH_CHILD_SEP(n, TRANSFORMED_IO_CHANNEL_ENTRY, (, )) },       \
     };                                                                                             \

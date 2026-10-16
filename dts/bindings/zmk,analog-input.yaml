@@ -26,6 +26,12 @@ properties:
       Measured wiper voltage at full deflection toward the supply rail, in mV.
       Hold acceleration triggers within AI_ACCEL_EDGE_MV of this value.
       A GPIO-powered pot sits a little below 3300, so re-measure when gating.
+  game-layer:
+    type: int
+    default: 255
+    description: |
+      While this keymap layer is active the joystick presses keys (game-key-pos /
+      game-key-neg of each channel) instead of scrolling. 255 disables game mode.
 
 child-binding:
   description: Per-channel configuration settings
@@ -58,3 +64,11 @@ child-binding:
     input-code:
       type: int
       required: true
+    game-key-pos:
+      type: int
+      default: 0
+      description: Key for positive deflection in game mode (e.g. <D>, <W>). 0 = none.
+    game-key-neg:
+      type: int
+      default: 0
+      description: Key for negative deflection in game mode (e.g. <A>, <S>). 0 = none.

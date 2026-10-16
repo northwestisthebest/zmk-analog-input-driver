@@ -57,6 +57,8 @@ struct analog_input_io_channel {
     uint16_t scale_divisor;
     uint8_t evt_type;
     uint8_t input_code;
+    uint32_t game_key_pos;   /* encoded ZMK keycode, 0 = none */
+    uint32_t game_key_neg;
 };
 
 struct analog_input_config {
@@ -64,6 +66,7 @@ struct analog_input_config {
     struct gpio_dt_spec power_gpio;   /* optional; .port == NULL when absent */
     uint16_t power_settle_us;
     uint16_t mv_top;
+    uint8_t game_layer;               /* 255 = game mode disabled */
     uint8_t io_channels_len;
 	struct analog_input_io_channel io_channels[];
 };
