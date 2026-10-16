@@ -429,9 +429,11 @@ static void analog_input_async_init(struct k_work *work) {
     for (uint8_t i = 0; i < config->io_channels_len; i++) {
         struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
         const struct device* adc = ch_cfg.adc_channel.dev;
-        /* battery driver (VDDH) owns ADC channel 0 - shift ours up by one */
+        /* battery driver (VDDH) owns ADC channel 0. Ours take 1, 2, ... in list order:
+           keeps as_buff[i] in child-node order and stays within the 8 SAADC channels
+           for AIN7 (ain + 1 would be channel 8). */
         uint8_t ain = ch_cfg.adc_channel.channel_id;
-        uint8_t channel_id = ain + 1;
+        uint8_t channel_id = i + 1;
         
 #if CONFIG_ANALOG_INPUT_USE_DTS_ADC_CH_CFG
         struct adc_channel_cfg channel_cfg = ch_cfg.adc_channel.channel_cfg;
