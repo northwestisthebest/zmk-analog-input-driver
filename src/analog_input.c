@@ -59,10 +59,11 @@ static uint16_t mid_now[8];          /* resolved centre per channel */
 static uint32_t       game_keys[8];
 static atomic_t       game_want;
 static uint8_t        game_sent;
-static bool           game_engaged[4];
-static bool           game_on[4];
-static int64_t        game_last_flip[4];
-
+static bool           game_engaged;
+static bool           game_on;
+static int64_t        game_last_flip;
+static int16_t        game_v[2];   /* per-axis deflection collected this sample */
+static uint16_t       game_mm[2];
 static void game_keys_work_cb(struct k_work *work) {
     ARG_UNUSED(work);
     uint8_t want = (uint8_t)atomic_get(&game_want);
@@ -84,49 +85,72 @@ static void game_set_want(uint8_t want) {
     }
 }
 
-/* v: signed deflection past the deadzone, clamped to +-mm, already inverted */
-static uint8_t game_axis(uint8_t i, int16_t v, uint16_t mm, int64_t now) {
-    if (i >= 4 || mm == 0) {
-        return 0;
+static int32_t isqrt32(int32_t n) {
+    int32_t r = 0;
+    while ((r + 1) * (r + 1) <= n) {
+        r++;
     }
-    int32_t av  = (v < 0) ? -(int32_t)v : (int32_t)v;
-    int32_t pct = (av * 100) / mm;
+    return r;
+}
 
-    if (!game_engaged[i] && pct >= AI_GAME_ON_PCT) {
-        game_engaged[i] = true;
-        game_on[i] = true;              /* respond immediately */
-        game_last_flip[i] = now;
-    } else if (game_engaged[i] && pct < AI_GAME_OFF_PCT) {
-        game_engaged[i] = false;
-        game_on[i] = false;
+/* The stick is treated as one vector, not two independent axes:
+ *  - magnitude (0..100 %) decides engage / PWM duty / solid hold, so a full
+ *    diagonal push on a round gate counts as full, not ~70 % per axis
+ *  - angle picks the keys, 8-way: an axis joins when its component is at
+ *    least sin(22.5 deg) ~ 38 % of the magnitude */
+static uint8_t game_vector(int64_t now) {
+    int32_t nx = game_mm[0] ? ((int32_t)game_v[0] * 100) / game_mm[0] : 0;
+    int32_t ny = game_mm[1] ? ((int32_t)game_v[1] * 100) / game_mm[1] : 0;
+    int32_t mag = isqrt32(nx * nx + ny * ny);
+    if (mag > 100) {
+        mag = 100;   /* square-ish gates overshoot in the corners */
     }
-    if (!game_engaged[i] || v == 0) {
+
+    if (!game_engaged && mag >= AI_GAME_ON_PCT) {
+        game_engaged = true;
+        game_on = true;                 /* respond immediately */
+        game_last_flip = now;
+    } else if (game_engaged && mag < AI_GAME_OFF_PCT) {
+        game_engaged = false;
+        game_on = false;
+    }
+    if (!game_engaged || mag == 0) {
         return 0;
     }
 
     bool press = true;
-    if (AI_GAME_PWM_MS > 0 && pct < AI_GAME_FULL_PCT) {
+    if (AI_GAME_PWM_MS > 0 && mag < AI_GAME_FULL_PCT) {
         int32_t span  = AI_GAME_FULL_PCT - AI_GAME_ON_PCT;
-        int32_t p     = CLAMP(pct - AI_GAME_ON_PCT, 0, span);
+        int32_t p     = CLAMP(mag - AI_GAME_ON_PCT, 0, span);
         int32_t on_ms = AI_GAME_MIN_PULSE_MS +
                         ((AI_GAME_PWM_MS - AI_GAME_MIN_PULSE_MS) * p) / span;
         int32_t off_ms = AI_GAME_PWM_MS - on_ms;
         if (off_ms >= AI_GAME_MIN_PULSE_MS) {
-            int64_t held = now - game_last_flip[i];
-            if (game_on[i] && held >= on_ms) {
-                game_on[i] = false;
-                game_last_flip[i] = now;
-            } else if (!game_on[i] && held >= off_ms) {
-                game_on[i] = true;
-                game_last_flip[i] = now;
+            int64_t held = now - game_last_flip;
+            if (game_on && held >= on_ms) {
+                game_on = false;
+                game_last_flip = now;
+            } else if (!game_on && held >= off_ms) {
+                game_on = true;
+                game_last_flip = now;
             }
-            press = game_on[i];
+            press = game_on;
         }
     }
     if (!press) {
         return 0;
     }
-    return (v > 0) ? BIT(2 * i) : BIT(2 * i + 1);
+
+    uint8_t bits = 0;
+    int32_t ax = (nx < 0) ? -nx : nx;
+    int32_t ay = (ny < 0) ? -ny : ny;
+    if (ax * 100 >= 38 * mag) {
+        bits |= (nx > 0) ? BIT(0) : BIT(1);
+    }
+    if (ay * 100 >= 38 * mag) {
+        bits |= (ny > 0) ? BIT(2) : BIT(3);
+    }
+    return bits;
 }
 
 static int analog_input_report_data(const struct device *dev) {
@@ -152,11 +176,12 @@ static int analog_input_report_data(const struct device *dev) {
     static bool game_prev;
     static int64_t game_keepalive;
     uint8_t game_bits = 0;
+    memset(game_v, 0, sizeof(game_v));
     const int64_t game_now = k_uptime_get();
     if (game != game_prev) {
         if (!game) {
-            memset(game_engaged, 0, sizeof(game_engaged));
-            memset(game_on, 0, sizeof(game_on));
+            game_engaged = false;
+            game_on = false;
             game_set_want(0);
         }
         scroll_owner = -1;
@@ -303,7 +328,10 @@ static int analog_input_report_data(const struct device *dev) {
         if (ch_cfg.invert) v *= -1;
 
         if (game) {
-            game_bits |= game_axis(i, v, mm, game_now);
+            if (i < 2) {
+                game_v[i] = v;
+                game_mm[i] = mm;
+            }
             continue;   /* no scroll output in game mode */
         }
 
@@ -382,6 +410,7 @@ static int analog_input_report_data(const struct device *dev) {
     as->calibrate = false;
 
     if (game) {
+        game_bits = game_vector(game_now);
         game_set_want(game_bits);
         /* key events don't count as ZMK activity; an ignored input event does */
         if (game_bits && game_now - game_keepalive >= AI_GAME_KEEPALIVE_MS) {
